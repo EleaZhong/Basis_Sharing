@@ -10,7 +10,7 @@ model_args:
 calibration_args:
   dataset_name: "wikitext"
   calibration_size: 256
-  calib_batch_size: 64
+  calib_batch_size: 1
   dataset_cache_dir: null
 
 model_saving:

@@ -23,6 +23,7 @@ Usage:
 
 from __future__ import annotations
 
+import gc
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -160,6 +161,8 @@ class ShareLinear(nn.Module):
         bias: bool = True,
         device=None,
         dtype=None,
+        *,
+        _skip_weight_init: bool = False,
     ):
         super().__init__()
         self.in_features = in_features
@@ -168,14 +171,19 @@ class ShareLinear(nn.Module):
         self._state = ShareLinearState.ORIGINAL
 
         # Original weights (temporary, cleared after compression)
-        self.original_weight: nn.Parameter | None = nn.Parameter(
-            torch.empty(out_features, in_features, device=device, dtype=dtype)
-        )
-        self.original_bias: nn.Parameter | None = (
-            nn.Parameter(torch.zeros(out_features, device=device, dtype=dtype))
-            if bias
-            else None
-        )
+        # When _skip_weight_init=True, weights are set by from_linear() to avoid double allocation
+        if _skip_weight_init:
+            self.original_weight: nn.Parameter | None = None
+            self.original_bias: nn.Parameter | None = None
+        else:
+            self.original_weight = nn.Parameter(
+                torch.empty(out_features, in_features, device=device, dtype=dtype)
+            )
+            self.original_bias = (
+                nn.Parameter(torch.zeros(out_features, device=device, dtype=dtype))
+                if bias
+                else None
+            )
 
         # Calibration accumulator (X^T @ X)
         self.register_buffer("calib_xtx", None)
@@ -206,17 +214,30 @@ class ShareLinear(nn.Module):
         layer_idx: int = -1,
         proj_type: str = "",
     ) -> ShareLinear:
-        """Create ShareLinear from existing nn.Linear, copying weights."""
+        """Create ShareLinear from existing nn.Linear, transferring weight ownership.
+        
+        This avoids cloning weights to save memory during model initialization.
+        The original linear's weight tensors are transferred, not copied.
+        """
+        # Skip weight init to avoid double allocation
         share = cls(
             linear.in_features,
             linear.out_features,
             bias=linear.bias is not None,
             device=linear.weight.device,
             dtype=linear.weight.dtype,
+            _skip_weight_init=True,
         )
-        share.original_weight = nn.Parameter(linear.weight.data.clone())
+        # Transfer ownership instead of cloning to save memory
+        # Use .data to get the underlying tensor and wrap in new Parameter
+        share.original_weight = nn.Parameter(linear.weight.data)
         if linear.bias is not None:
-            share.original_bias = nn.Parameter(linear.bias.data.clone())
+            share.original_bias = nn.Parameter(linear.bias.data)
+        
+        # Clear original linear's references to help garbage collection
+        linear.weight = None
+        linear.bias = None
+        
         share.name = name
         share.layer_idx = layer_idx
         share.proj_type = proj_type
@@ -432,23 +453,26 @@ class BasisSharingWrapper(nn.Module):
 
         return True
 
-    def _set_module_by_name(self, name: str, new_module: nn.Module):
-        """Replace a module in the model by its name."""
-        parts = name.split(".")
-        parent = self.model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        setattr(parent, parts[-1], new_module)
-
     def _replace_target_linears(self):
         """Replace all target nn.Linear modules with ShareLinear."""
-        modules_to_replace = []
+        # Only collect names, not module references (to avoid holding references)
+        names_to_replace = []
 
         for name, module in self.model.named_modules():
             if self._should_replace(name, module):
-                modules_to_replace.append((name, module))
+                names_to_replace.append(name)
 
-        for name, module in modules_to_replace:
+        # Replace in batches with periodic garbage collection to manage memory
+        gc_interval = 8  # Trigger GC every N replacements
+        
+        for i, name in enumerate(names_to_replace):
+            # Get the module fresh each time (don't hold references in a list)
+            parts = name.split(".")
+            parent = self.model
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            module = getattr(parent, parts[-1])
+            
             layer_idx = self._extract_layer_idx(name)
             proj_type = self._extract_proj_type(name)
 
@@ -456,13 +480,26 @@ class BasisSharingWrapper(nn.Module):
                 module, name=name, layer_idx=layer_idx, proj_type=proj_type
             )
 
-            self._set_module_by_name(name, share_linear)
+            # Replace immediately after creating ShareLinear
+            setattr(parent, parts[-1], share_linear)
             self.share_linears[name] = share_linear
 
             # Organize by projection type
             if proj_type not in self.proj_layers:
                 self.proj_layers[proj_type] = {}
             self.proj_layers[proj_type][layer_idx] = share_linear
+            
+            # Clear local reference and periodically garbage collect
+            del module
+            if (i + 1) % gc_interval == 0:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # Final cleanup
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         print(f"Replaced {len(self.share_linears)} Linear modules with ShareLinear")
         for proj_type, layers in self.proj_layers.items():
