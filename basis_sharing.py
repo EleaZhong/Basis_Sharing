@@ -65,6 +65,8 @@ class BasisSharingConfig:
         exclude_modules: Regex patterns for modules to explicitly exclude
         share_qkv_basis: Whether Q, K, V projections share calibration data (same input)
         share_gate_up_basis: Whether gate and up projections share calibration data
+        svd_device: Device for SVD computation ("cpu", "cuda", or "auto"). CUDA SVD is
+            significantly faster for large matrices but requires GPU memory.
     """
 
     target_modules: list[str]
@@ -74,6 +76,7 @@ class BasisSharingConfig:
     exclude_modules: list[str] = field(default_factory=list)
     share_qkv_basis: bool = True
     share_gate_up_basis: bool = True
+    svd_device: str = "auto"
 
     def should_target(self, name: str) -> bool:
         """Check if a module name should be targeted for compression."""
@@ -498,7 +501,13 @@ class BasisSharingWrapper(nn.Module):
         # Replace in batches with periodic garbage collection to manage memory
         gc_interval = 8  # Trigger GC every N replacements
         
-        for i, name in enumerate(names_to_replace):
+        pbar = tqdm(
+            names_to_replace,
+            desc="Replacing Linear → ShareLinear",
+            unit="module",
+            leave=True,
+        )
+        for i, name in enumerate(pbar):
             # Get the module fresh each time (don't hold references in a list)
             parts = name.split(".")
             parent = self.model
@@ -522,12 +531,21 @@ class BasisSharingWrapper(nn.Module):
                 self.proj_layers[proj_type] = {}
             self.proj_layers[proj_type][layer_idx] = share_linear
             
+            # Update progress bar with current module info
+            pbar.set_postfix(
+                layer=layer_idx,
+                proj=proj_type,
+                replaced=i + 1,
+            )
+            
             # Clear local reference and periodically garbage collect
             del module
             if (i + 1) % gc_interval == 0:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+        pbar.close()
 
         # Final cleanup
         gc.collect()
@@ -576,15 +594,48 @@ class BasisSharingWrapper(nn.Module):
 
         try:
             num_samples = 0
-            for batch in tqdm(dataloader, desc="Calibrating"):
+            total_tokens = 0
+            
+            # Determine total for progress bar
+            total = max_samples if max_samples is not None else len(dataloader)
+            
+            pbar = tqdm(
+                dataloader,
+                desc="Calibrating",
+                total=total,
+                unit="batch",
+                leave=True,
+            )
+            for batch in pbar:
                 batch = {k: v.to(device) for k, v in batch.items()}
+                
+                # Track tokens if input_ids present
+                if "input_ids" in batch:
+                    batch_tokens = batch["input_ids"].numel()
+                    total_tokens += batch_tokens
+                
                 _ = self.model(**batch)
-
                 num_samples += 1
+                
+                # Update progress bar with stats
+                postfix = {"batches": num_samples}
+                if total_tokens > 0:
+                    postfix["tokens"] = f"{total_tokens:,}"
+                if torch.cuda.is_available():
+                    mem_gb = torch.cuda.memory_allocated() / 1e9
+                    postfix["GPU_mem"] = f"{mem_gb:.1f}GB"
+                pbar.set_postfix(postfix)
+                
                 if max_samples is not None and num_samples >= max_samples:
                     break
-
-            print(f"Calibration complete: {num_samples} batches processed")
+            
+            pbar.close()
+            
+            # Print summary
+            summary = f"Calibration complete: {num_samples} batches"
+            if total_tokens > 0:
+                summary += f", {total_tokens:,} tokens"
+            print(summary)
 
         finally:
             self.end_calibration()
@@ -692,6 +743,13 @@ class BasisSharingWrapper(nn.Module):
 
         return groups
 
+    def _get_svd_device(self) -> torch.device:
+        """Determine the device for SVD computation based on config."""
+        svd_device = self.config.svd_device
+        if svd_device == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(svd_device)
+
     def _run_svd_for_group(
         self,
         proj_type: str,
@@ -721,8 +779,8 @@ class BasisSharingWrapper(nn.Module):
         # Concatenate: (in_features, out_features * group_size)
         w_concat = torch.cat(weights, dim=-1).double()
 
-        # Move to same device as whitening matrices
-        device = s.device
+        # Move to SVD device (CUDA is faster for large matrices)
+        device = self._get_svd_device()
         w_concat = w_concat.to(device)
         s = s.to(device)
         s_inv = s_inv.to(device)
@@ -772,67 +830,100 @@ class BasisSharingWrapper(nn.Module):
 
         # Create groups
         self.groups = self._create_groups()
-        print(f"Created groups for {len(self.groups)} projection types")
+        
+        # Print group summary
+        total_groups = sum(len(groups) for groups in self.groups.values())
+        total_layers = sum(
+            sum(len(g) for g in groups) for groups in self.groups.values()
+        )
+        print(f"Created {total_groups} groups across {len(self.groups)} projection types ({total_layers} layers)")
+        
+        completed_groups = 0
+        completed_layers = 0
+        svd_device = self._get_svd_device()
+        
+        with tqdm(
+            total=total_groups,
+            desc="Compressing",
+            unit="group",
+            leave=True,
+        ) as pbar:
+            for proj_type, proj_groups in self.groups.items():
+                if not proj_groups:
+                    continue
 
-        for proj_type, proj_groups in tqdm(
-            self.groups.items(), desc="Compressing projections"
-        ):
-            if not proj_groups:
-                continue
+                # Initialize ModuleDict for this projection type's shared bases
+                self.shared_bases[proj_type] = nn.ModuleDict()
 
-            # Initialize ModuleDict for this projection type's shared bases
-            self.shared_bases[proj_type] = nn.ModuleDict()
-
-            layers = self.proj_layers[proj_type]
-
-            for group in proj_groups:
-                # Get calibration data for this group
-                calib_data = self._get_calibration_data_for_proj(proj_type, group)
-
-                # Compute whitening matrix
-                s, s_inv = self._compute_whitening(calib_data)
-
-                # Run SVD
-                basis_weights, coefficients = self._run_svd_for_group(
-                    proj_type, group, s, s_inv
-                )
-
-                # Create shared basis module
-                in_features = layers[group[0]].in_features
-                num_basis = basis_weights.shape[1]
-
-                shared_basis = Basis(
-                    in_features,
-                    num_basis,
-                    device=basis_weights.device,
-                    dtype=basis_weights.dtype,
-                )
-                shared_basis.set_weight(basis_weights)
-
-                # Store shared basis (use first layer index as key)
-                group_key = str(group[0])
-                self.shared_bases[proj_type][group_key] = shared_basis
-
-                # Setup each layer with shared basis and its coefficient
-                for i, layer_idx in enumerate(group):
-                    share_linear = layers[layer_idx]
-                    out_features = share_linear.out_features
-
-                    # Create coefficient for this layer
-                    coefficient = Coefficient(
-                        num_basis,
-                        out_features,
-                        bias=False,  # Original bias is handled separately
-                        device=coefficients[i].device,
-                        dtype=coefficients[i].dtype,
+                layers = self.proj_layers[proj_type]
+                
+                for group_idx, group in enumerate(proj_groups):
+                    # Detailed progress info
+                    in_f = layers[group[0]].in_features
+                    out_f = layers[group[0]].out_features
+                    pbar.set_postfix(
+                        proj=proj_type,
+                        layers=f"{group[0]}-{group[-1]}",
+                        shape=f"{in_f}×{out_f}",
+                        device=str(svd_device),
                     )
-                    coefficient.set_weight(coefficients[i])
+                    
+                    # Get calibration data for this group
+                    calib_data = self._get_calibration_data_for_proj(proj_type, group)
 
-                    # Setup compressed mode
-                    share_linear.setup_compressed(
-                        basis=shared_basis,
-                        coefficient=coefficient,
-                        keep_bias=True,
+                    # Compute whitening matrix
+                    s, s_inv = self._compute_whitening(calib_data)
+
+                    # Run SVD
+                    basis_weights, coefficients = self._run_svd_for_group(
+                        proj_type, group, s, s_inv
+                    )
+
+                    # Create shared basis module
+                    in_features = layers[group[0]].in_features
+                    num_basis = basis_weights.shape[1]
+
+                    shared_basis = Basis(
+                        in_features,
+                        num_basis,
+                        device=basis_weights.device,
+                        dtype=basis_weights.dtype,
+                    )
+                    shared_basis.set_weight(basis_weights)
+
+                    # Store shared basis (use first layer index as key)
+                    group_key = str(group[0])
+                    self.shared_bases[proj_type][group_key] = shared_basis
+
+                    # Setup each layer with shared basis and its coefficient
+                    for i, layer_idx in enumerate(group):
+                        share_linear = layers[layer_idx]
+                        out_features = share_linear.out_features
+
+                        # Create coefficient for this layer
+                        coefficient = Coefficient(
+                            num_basis,
+                            out_features,
+                            bias=False,  # Original bias is handled separately
+                            device=coefficients[i].device,
+                            dtype=coefficients[i].dtype,
+                        )
+                        coefficient.set_weight(coefficients[i])
+
+                        # Setup compressed mode
+                        share_linear.setup_compressed(
+                            basis=shared_basis,
+                            coefficient=coefficient,
+                            keep_bias=True,
+                        )
+                        completed_layers += 1
+
+                    completed_groups += 1
+                    pbar.update(1)
+                    
+                    # Update description with completion stats
+                    pbar.set_description(
+                        f"Compressing ({completed_layers}/{total_layers} layers)"
                     )
 
         # Clear calibration data
