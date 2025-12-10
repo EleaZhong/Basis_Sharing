@@ -1,207 +1,218 @@
-import os.path
-from transformers import AutoConfig, AutoModelForCausalLM
+"""
+Model Factory for Basis Sharing Compression.
+
+This module provides functions to create and compress models using the
+model-agnostic BasisSharingWrapper.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import TYPE_CHECKING
+
 import torch
-from transformers import AutoTokenizer, LlamaTokenizer
-from torch.utils.data import DataLoader
-from torch.utils.data import Subset
-from accelerate import load_checkpoint_and_dispatch
+from torch.utils.data import DataLoader, Subset
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer
 
+from basis_sharing import BasisSharingConfig, BasisSharingWrapper
 from config import ShareConfig
-from utils import match_state_dict
-from calib import Calib
 from prepare_data import prepare_data
-from utils import compute_num_basis
-from group import change_model, update_model
-from models.gpt2 import ShareGPT2LMHeadModel
-from models.llama import ShareLlamaForCausalLM
-from models.opt import ShareOPTForCausalLM
-from models.mistral import ShareMistralForCausalLM
+
+if TYPE_CHECKING:
+    pass
 
 
-def do_update_model(config, model, dataset, tokenizer, data_collator):
-    if os.path.exists(config.updated_model_path):
-        print("Start load model!")
-        print("Load: {}".format(config.updated_model_path))
-        if config.model_type == "gpt2":
-            model = ShareGPT2LMHeadModel.from_pretrained(config.updated_model_path, device_map='auto')
-        elif config.model_type == "llama2":
-            model = ShareLlamaForCausalLM.from_pretrained(config.updated_model_path, device_map='auto')
-        elif config.model_type == "opt":
-            model = ShareOPTForCausalLM.from_pretrained(config.updated_model_path, device_map='auto')
-        elif config.model_type == "mistral":
-            model = ShareMistralForCausalLM.from_pretrained(config.updated_model_path, device_map='auto')
-        else:
-            raise ValueError
+# Default target module patterns for common architectures
+MODEL_TARGET_PATTERNS: dict[str, list[str]] = {
+    "llama2": [
+        r"self_attn\.k_proj",
+        r"self_attn\.q_proj",
+        r"self_attn\.v_proj",
+        r"self_attn\.o_proj",
+        r"mlp\.up_proj",
+        r"mlp\.gate_proj",
+        r"mlp\.down_proj",
+    ],
+    "mistral": [
+        r"self_attn\.k_proj",
+        r"self_attn\.q_proj",
+        r"self_attn\.v_proj",
+        r"self_attn\.o_proj",
+        r"mlp\.up_proj",
+        r"mlp\.gate_proj",
+        r"mlp\.down_proj",
+    ],
+    "opt": [
+        r"self_attn\.k_proj",
+        r"self_attn\.q_proj",
+        r"self_attn\.v_proj",
+        r"self_attn\.out_proj",
+        r"\.fc1$",
+        r"\.fc2$",
+    ],
+    "gpt2": [
+        r"attn\.c_attn",
+        r"attn\.c_proj",
+        r"mlp\.c_fc",
+        r"mlp\.c_proj",
+    ],
+}
+
+# Modules to exclude from compression
+EXCLUDE_PATTERNS: list[str] = [
+    r"lm_head",
+    r"embed_tokens",
+    r"wte",
+    r"wpe",
+    r"embed_positions",
+    r"project_in",
+    r"project_out",
+]
+
+
+def get_target_patterns(model_type: str) -> list[str]:
+    """Get target module patterns for a model type."""
+    return MODEL_TARGET_PATTERNS.get(model_type, MODEL_TARGET_PATTERNS["llama2"])
+
+
+def get_tokenizer(config: ShareConfig):
+    """Get the appropriate tokenizer for the model."""
+    if config.model_type == "llama2":
+        tokenizer = LlamaTokenizer.from_pretrained(config.model_name)
     else:
-        std_model = AutoModelForCausalLM.from_pretrained(config.model_name, device_map="cpu")
-        std_model.config.use_cache = False
-        model = load_checkpoint_and_dispatch(model, config.untrained_model_path, device_map="auto")
-
-        # Prepare Dataloader for calibration data
-        torch.manual_seed(2023)
-        index = torch.randperm(len(dataset))
-        index = index[:config.calibration_size]
-        subset = Subset(dataset, index)
-        dataloader = DataLoader(subset, batch_size=config.calib_batch_size, shuffle=False, collate_fn=data_collator,
-                                pin_memory=True, num_workers=4)
-
-        if config.build_update_calib:
-            print("Start build update calib!")
-            names = config.share_part + config.private_part
-            basis_name = []
-            for name in names:
-                if name == "q" or name == "v" or name == "gate":
-                    continue
-                basis_name.append(name + "_basis")
-
-            Calib.build_update_dataset(model, dataloader, basis_name, config.model_type, config.update_calib_path)
-
-        model_config = model.config
-        short_model_name = ShareConfig.name_map[config.model_name]
-
-        names = config.share_part + config.private_part
-        for name in names:
-            print("Update {}".format(name))
-            model = update_model(std_model=std_model,
-                                 model=model,
-                                 model_type=config.model_type,
-                                 groups=getattr(model_config, name + "_groups"),
-                                 name=getattr(config, name + "_name"),
-                                 step=
-                                 ShareConfig.weight_info[short_model_name][getattr(config, name + "_name")][
-                                     1],
-                                 num_basis=getattr(model_config, "num_basis_" + name),
-                                 basis_name=name + "_basis",
-                                 calib_path=config.update_calib_path,
-                                 )
-        if config.save_updated_model:
-            model.save_pretrained(config.updated_model_path, safe_serialization=False)
-            tokenizer.save_pretrained(config.updated_model_path)
-    return model
+        tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.pad_token or "[PAD]"
+    return tokenizer
 
 
-def create_model(config):
-    if os.path.exists(config.untrained_model_path):
-        model_path = config.untrained_model_path
-        print("Start load model!")
-        print("Start load: {}".format(config.untrained_model_path))
-        if config.model_type == "gpt2":
-            model = ShareGPT2LMHeadModel.from_pretrained(model_path, device_map='auto', )
-        elif config.model_type == "llama2":
-            if "30b" in config.untrained_model_path:
-                model = ShareLlamaForCausalLM.from_pretrained(model_path, device_map='auto',
-                                                              torch_dtype=torch.float16)
-            else:
-                model = ShareLlamaForCausalLM.from_pretrained(model_path, device_map='cpu')
-        elif config.model_type == "opt":
-            model = ShareOPTForCausalLM.from_pretrained(model_path, device_map='auto')
-        elif config.model_type == "mistral":
-            model = ShareMistralForCausalLM.from_pretrained(model_path, device_map='auto')
-        else:
-            raise ValueError
+def create_compressed_model(
+    config: ShareConfig,
+    save_path: str | None = None,
+) -> BasisSharingWrapper:
+    """Create a compressed model using BasisSharingWrapper.
 
+    This function:
+    1. Loads the base model from HuggingFace
+    2. Wraps it with BasisSharingWrapper
+    3. Runs calibration
+    4. Compresses the model
+    5. Optionally saves the compressed model
+
+    Args:
+        config: ShareConfig with model and compression settings
+        save_path: Optional path to save the compressed model
+
+    Returns:
+        BasisSharingWrapper containing the compressed model
+    """
+    # Determine save path from config if not provided
+    if save_path is None:
+        save_path = getattr(config, "compressed_model_path", None)
+
+    # Check for existing compressed model
+    if save_path and os.path.exists(save_path):
+        print(f"Loading existing compressed model from {save_path}")
+        return load_compressed_model(config, save_path)
+
+    # Load tokenizer
+    tokenizer = get_tokenizer(config)
+
+    # Load base model
+    print(f"Loading base model: {config.model_name}")
+    model_kwargs: dict = {"device_map": "auto"}
+
+    if hasattr(config, "model_name") and "30b" in config.model_name:
+        model_kwargs["torch_dtype"] = torch.float16
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.config.use_cache = False
+
+    # Get target patterns for this model type
+    target_patterns = get_target_patterns(config.model_type)
+
+    # Create BasisSharingConfig
+    basis_config = BasisSharingConfig(
+        target_modules=target_patterns,
+        group_size=config.group_size,
+        compression_ratio=config.compression_ratio / 100,  # Convert from percentage
+        exclude_modules=EXCLUDE_PATTERNS,
+        exclude_layers=[],
+    )
+
+    # Create wrapper
+    print("Creating BasisSharingWrapper...")
+    wrapper = BasisSharingWrapper(model, basis_config)
+
+    # Prepare calibration data
+    print("Preparing calibration data...")
+    train_dataset, _, _, data_collator = prepare_data(
+        config.dataset_name,
+        tokenizer,
+        config.context_length,
+        getattr(config, "dataset_cache_dir", None),
+    )
+
+    # Create calibration dataloader
+    torch.manual_seed(2023)
+    calib_size = getattr(config, "calibration_size", 256)
+    indices = torch.randperm(len(train_dataset))[:calib_size]
+    subset = Subset(train_dataset, indices.tolist())
+
+    batch_size = getattr(config, "calib_batch_size", 16)
+    dataloader = DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=data_collator,
+        pin_memory=True,
+        num_workers=4,
+    )
+
+    # Run calibration
+    print("Running calibration...")
+    wrapper.calibrate(dataloader)
+
+    # Compress
+    print("Compressing model...")
+    wrapper.compress()
+
+    # Save if path provided
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        wrapper.save_compressed(save_path)
+        tokenizer.save_pretrained(os.path.dirname(save_path))
+
+    return wrapper
+
+
+def load_compressed_model(
+    config: ShareConfig,
+    path: str,
+    device: str | torch.device = "auto",
+) -> BasisSharingWrapper:
+    """Load a previously compressed model.
+
+    Args:
+        config: ShareConfig with model settings
+        path: Path to saved compressed model
+        device: Device to load model on
+
+    Returns:
+        BasisSharingWrapper with loaded compressed model
+    """
+    # Load base model structure
+    model_kwargs: dict = {}
+    if device == "auto":
+        model_kwargs["device_map"] = "auto"
     else:
-        if config.model_type == "llama2":
-            tokenizer = LlamaTokenizer.from_pretrained(config.model_name)
-        else:
-            tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-        tokenizer.pad_token = "[PAD]"
-        print("Start create model!")
-        model_config = AutoConfig.from_pretrained(config.model_name)
-        model_config.use_cache = False
-        if config.model_name == "jeffwan/llama-30b-hf":
-            std_model = AutoModelForCausalLM.from_pretrained(config.model_name, device_map="auto",
-                                                             torch_dtype=torch.float16)
-        else:
-            std_model = AutoModelForCausalLM.from_pretrained(config.model_name, device_map="auto")
+        model_kwargs["device_map"] = {"": device}
 
-        if config.build_calib:
-            train_dataset, val_dataset, tokenized_test, data_collator = prepare_data(config.dataset_name, tokenizer,
-                                                                                     config.context_length, config.dataset_cache_dir)
-            # Prepare Dataloader for calibration data
-            torch.manual_seed(2023)
-            index = torch.randperm(len(train_dataset))
-            index = index[:config.calibration_size]
-            subset = Subset(train_dataset, index)
-            dataloader = DataLoader(subset, batch_size=config.calib_batch_size, shuffle=False, collate_fn=data_collator,
-                                    pin_memory=True, num_workers=4)
+    if hasattr(config, "model_name") and "30b" in config.model_name:
+        model_kwargs["torch_dtype"] = torch.float16
 
-            print("Start create calib!")
-            calib_names = []
-            if hasattr(config, "k_name"):
-                # calibration data for k, q, v is the same
-                calib_names.append(config.k_name)
-            if hasattr(config, "attn_name"):
-                calib_names.append(config.attn_name)
-            calib_names.append(config.o_name)
-            calib_names.append(config.up_name)
-            calib_names.append(config.down_name)
-            Calib.build_calibration_dataset(std_model, dataloader, calib_names, config.model_type, config.calib_path)
-            print("Calib build done!")
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
 
-        short_model_name = ShareConfig.name_map[config.model_name]
+    # Load compressed state
+    wrapper = BasisSharingWrapper.load_compressed(model, path, device=device)
 
-        # Share Part
-        names = config.share_part
-        for name in names:
-            print("Config for {}".format(name))
-            nx, nf = ShareConfig.weight_info[short_model_name][getattr(config, name + "_name")]
-            num_group = model_config.num_hidden_layers // config.group_size
-            rest = model_config.num_hidden_layers % config.group_size
-            gs = config.group_size
-            group = [[gs * i + j for j in range(config.group_size)] for i in range(num_group)]
-            if rest != 0:
-                group += [[num_group * config.group_size + i for i in range(rest)]]
-            setattr(model_config, name + "_groups", group)
-            num_basis = compute_num_basis(nx, nf, config.group_size, config.compression_ratio)
-            setattr(model_config, "num_basis_" + name, num_basis)
-            print("num_basis {}".format(num_basis))
-
-        # Private Part
-        names = config.private_part
-        for name in names:
-            print("Config for {}".format(name))
-            setattr(model_config, name + "_groups", [[i] for i in range(model_config.num_hidden_layers)])
-            nx, nf = ShareConfig.weight_info[short_model_name][getattr(config, name + "_name")]
-            num_basis = compute_num_basis(nx, nf, 1, config.compression_ratio)
-            setattr(model_config, "num_basis_" + name, num_basis)
-            print("num_basis {}".format(num_basis))
-
-        if config.model_type == "llama2":
-            if "30b" in config.model_name:
-                model_config.torch_dtype = torch.float16
-            model = ShareLlamaForCausalLM(model_config)
-        elif config.model_type == "gpt2":
-            model = ShareGPT2LMHeadModel(model_config)
-        elif config.model_type == "opt":
-            model = ShareOPTForCausalLM(model_config)
-        elif config.model_type == "mistral":
-            model = ShareMistralForCausalLM(model_config)
-        else:
-            raise NotImplementedError
-
-        print("Model init finished!")
-        if not hasattr(config, "tfs"):
-            matched_state_dict, _ = match_state_dict(model.state_dict(), std_model.state_dict())
-            model.load_state_dict(matched_state_dict, strict=False)
-
-            # Share Part
-            names = config.share_part + config.private_part
-            for name in names:
-                print("Change {}".format(name))
-                model = change_model(std_model=std_model,
-                                     model=model,
-                                     model_type=config.model_type,
-                                     groups=getattr(model_config, name + "_groups"),
-                                     name=getattr(config, name + "_name"),
-                                     step=ShareConfig.weight_info[short_model_name][getattr(config, name + "_name")][1],
-                                     num_basis=getattr(model_config, "num_basis_" + name),
-                                     basis_name=name + "_basis",
-                                     calib_path=config.calib_path,
-                                     )
-
-            if config.save_untrained_model:
-                model.save_pretrained(config.untrained_model_path, safe_serialization=False)
-                tokenizer.save_pretrained(config.untrained_model_path)
-
-    return model
+    return wrapper

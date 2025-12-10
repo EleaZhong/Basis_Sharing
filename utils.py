@@ -1,37 +1,79 @@
-def match_state_dict(
-        state_dict_a,
-        state_dict_b
-):
-    """ Filters state_dict_b to contain only states that are present in state_dict_a.
+"""
+Utility functions for Basis Sharing.
+"""
 
-    Matching happens according to two criteria:
-        - Is the key present in state_dict_a?
-        - Does the state with the same key in state_dict_a have the same shape?
+from __future__ import annotations
 
-    Returns
-        (matched_state_dict, unmatched_state_dict)
+import torch
+import torch.nn as nn
 
-        States in matched_state_dict contains states from state_dict_b that are also
-        in state_dict_a and unmatched_state_dict contains states that have no
-        corresponding state in state_dict_a.
 
-        In addition: state_dict_b = matched_state_dict U unmatched_state_dict.
+def compute_num_basis(
+    nx: int,
+    nf: int,
+    group_size: int,
+    compression_ratio: float,
+) -> int:
+    """Compute the number of basis vectors for target compression ratio.
+
+    Args:
+        nx: Input dimension (hidden size)
+        nf: Output dimension (typically projection size)
+        group_size: Number of layers sharing the basis
+        compression_ratio: Target compression percentage (e.g., 20 for 20%)
+
+    Returns:
+        Number of basis vectors to use
     """
-    matched_state_dict = {
-        key: state
-        for (key, state) in state_dict_b.items()
-        if key in state_dict_a and state.shape == state_dict_a[key].shape
-    }
-    unmatched_state_dict = {
-        key: state
-        for (key, state) in state_dict_b.items()
-        if key not in matched_state_dict
-    }
-    return matched_state_dict, unmatched_state_dict
-
-
-def compute_num_basis(nx, nf, group_strategy, compression_ratio):
+    # Convert from percentage to fraction (e.g., 20 -> 0.8 for 80% reduction)
     compression_ratio = 1 - compression_ratio / 100
-    total = nx * nf * group_strategy
-    num_basis = (total * compression_ratio) // (nx + nf * group_strategy)
-    return int(num_basis)
+
+    # Original parameters: nx * nf * group_size
+    total = nx * nf * group_size
+
+    # Compressed parameters: nx * num_basis + num_basis * nf * group_size
+    num_basis = (total * compression_ratio) // (nx + nf * group_size)
+
+    return max(1, int(num_basis))
+
+
+def get_device(model: nn.Module) -> str:
+    """Get the device of a model."""
+    try:
+        return str(next(model.parameters()).device)
+    except StopIteration:
+        return "cpu"
+
+
+def count_parameters(model: nn.Module, trainable_only: bool = False) -> int:
+    """Count the number of parameters in a model."""
+    if trainable_only:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return sum(p.numel() for p in model.parameters())
+
+
+def print_model_size(model: nn.Module, name: str = "Model") -> None:
+    """Print model size information."""
+    total_params = count_parameters(model)
+    trainable_params = count_parameters(model, trainable_only=True)
+
+    print(f"{name} Statistics:")
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")
+    print(f"  Non-trainable parameters: {total_params - trainable_params:,}")
+
+    # Estimate size in MB (assuming float32)
+    size_mb = total_params * 4 / (1024 * 1024)
+    print(f"  Estimated size (FP32): {size_mb:.2f} MB")
+
+
+def freeze_module(module: nn.Module) -> None:
+    """Freeze all parameters in a module."""
+    for param in module.parameters():
+        param.requires_grad = False
+
+
+def unfreeze_module(module: nn.Module) -> None:
+    """Unfreeze all parameters in a module."""
+    for param in module.parameters():
+        param.requires_grad = True
