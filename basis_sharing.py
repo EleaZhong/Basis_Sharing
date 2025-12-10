@@ -34,6 +34,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+# Import Conv1D for GPT-2 support
+try:
+    from transformers.pytorch_utils import Conv1D
+except ImportError:
+    Conv1D = None  # Will be unavailable if transformers not installed
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from torch.utils.data import DataLoader
@@ -209,28 +215,51 @@ class ShareLinear(nn.Module):
     @classmethod
     def from_linear(
         cls,
-        linear: nn.Linear,
+        linear: nn.Linear | nn.Module,
         name: str = "",
         layer_idx: int = -1,
         proj_type: str = "",
     ) -> ShareLinear:
-        """Create ShareLinear from existing nn.Linear, transferring weight ownership.
+        """Create ShareLinear from existing nn.Linear or Conv1D, transferring weight ownership.
         
         This avoids cloning weights to save memory during model initialization.
         The original linear's weight tensors are transferred, not copied.
+        
+        Note: Conv1D (used by GPT-2) stores weights as (in_features, out_features)
+        while nn.Linear stores as (out_features, in_features). We normalize to
+        nn.Linear convention internally.
         """
+        # Detect if this is a Conv1D layer (GPT-2 style)
+        is_conv1d = Conv1D is not None and isinstance(linear, Conv1D)
+        
+        if is_conv1d:
+            # Conv1D stores weight as (in_features, out_features)
+            in_features = linear.weight.shape[0]
+            out_features = linear.nf  # Conv1D uses nf for out_features
+        else:
+            # Standard nn.Linear
+            in_features = linear.in_features
+            out_features = linear.out_features
+        
         # Skip weight init to avoid double allocation
         share = cls(
-            linear.in_features,
-            linear.out_features,
+            in_features,
+            out_features,
             bias=linear.bias is not None,
             device=linear.weight.device,
             dtype=linear.weight.dtype,
             _skip_weight_init=True,
         )
+        
         # Transfer ownership instead of cloning to save memory
-        # Use .data to get the underlying tensor and wrap in new Parameter
-        share.original_weight = nn.Parameter(linear.weight.data)
+        # For Conv1D, transpose weight to nn.Linear convention (out, in)
+        if is_conv1d:
+            # Conv1D weight is (in, out), transpose to (out, in) for nn.Linear convention
+            share.original_weight = nn.Parameter(linear.weight.data.T.contiguous())
+        else:
+            # nn.Linear weight is already (out, in)
+            share.original_weight = nn.Parameter(linear.weight.data)
+        
         if linear.bias is not None:
             share.original_bias = nn.Parameter(linear.bias.data)
         
@@ -439,7 +468,11 @@ class BasisSharingWrapper(nn.Module):
 
     def _should_replace(self, name: str, module: nn.Module) -> bool:
         """Check if module should be replaced with ShareLinear."""
-        if not isinstance(module, nn.Linear):
+        # Check if module is nn.Linear or Conv1D (GPT-2 style)
+        is_linear = isinstance(module, nn.Linear)
+        is_conv1d = Conv1D is not None and isinstance(module, Conv1D)
+        
+        if not (is_linear or is_conv1d):
             return False
 
         # Check config patterns
@@ -882,7 +915,7 @@ class BasisSharingWrapper(nn.Module):
             load_device = "cpu"
         else:
             load_device = device
-        checkpoint = torch.load(path, map_location=load_device, weights_only=False)
+        checkpoint = torch.load(path, map_location=load_device)
 
         wrapper = cls(model, checkpoint["config"])
         wrapper.groups = checkpoint["groups"]

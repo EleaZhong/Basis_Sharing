@@ -44,7 +44,6 @@ def main():
     hflm = HFLM(
         pretrained=model,
         tokenizer=tokenizer,
-        batch_size="auto",
     )
 
     # Compute perplexity using lm_eval
@@ -53,6 +52,7 @@ def main():
         model=hflm,
         tasks=["wikitext"],
         device=device,
+        batch_size=config.calib_batch_size,
     )
 
     # Extract and print perplexity
