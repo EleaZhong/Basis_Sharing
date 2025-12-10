@@ -244,20 +244,29 @@ class ShareLinear(nn.Module):
 
     @torch.no_grad()
     def _track_input(self, x: torch.Tensor):
-        """Accumulate X^T @ X for whitening matrix computation."""
+        """Accumulate X^T @ X for whitening matrix computation.
+        
+        Keeps accumulation on GPU to avoid slow CPU transfers during calibration.
+        Data is moved to CPU only when retrieved via get_calibration_data().
+        """
         inp = x.detach().float()
         inp = inp.flatten(start_dim=0, end_dim=-2)  # (batch*seq, hidden)
-        xtx = (inp.T @ inp).cpu()
+        xtx = inp.T @ inp  # Keep on same device as input
 
         if self.calib_xtx is None:
             self.calib_xtx = xtx
         else:
+            # Handle potential device mismatch in edge cases
+            if self.calib_xtx.device != xtx.device:
+                self.calib_xtx = self.calib_xtx.to(xtx.device)
             self.calib_xtx = self.calib_xtx + xtx
         self.calib_count += 1
 
     def get_calibration_data(self) -> torch.Tensor | None:
-        """Return accumulated calibration data."""
-        return self.calib_xtx
+        """Return accumulated calibration data, moved to CPU for SVD computation."""
+        if self.calib_xtx is None:
+            return None
+        return self.calib_xtx.cpu()
 
     def clear_calibration_data(self):
         """Clear calibration data to free memory."""
