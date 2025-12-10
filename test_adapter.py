@@ -16,6 +16,7 @@ from model_factory import create_compressed_model
 
 
 BENCHMARK_TASKS = [
+    "wikitext",
     "openbookqa",
     "arc_easy",
     "arc_challenge",

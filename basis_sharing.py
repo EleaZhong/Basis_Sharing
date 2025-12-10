@@ -876,7 +876,13 @@ class BasisSharingWrapper(nn.Module):
         cls, model: nn.Module, path: str, device: str | torch.device = "cpu"
     ) -> BasisSharingWrapper:
         """Load a compressed model."""
-        checkpoint = torch.load(path, map_location=device)
+        # Handle "auto" device - torch.load doesn't understand it
+        # Load to CPU first, then let the model's device_map handle placement
+        if device == "auto":
+            load_device = "cpu"
+        else:
+            load_device = device
+        checkpoint = torch.load(path, map_location=load_device, weights_only=False)
 
         wrapper = cls(model, checkpoint["config"])
         wrapper.groups = checkpoint["groups"]
