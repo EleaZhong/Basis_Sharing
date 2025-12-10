@@ -85,7 +85,13 @@ wrapper = BasisSharingWrapper.load_compressed(model, "compressed_model.pt")
 
 ## Evaluation
 
-### Perplexity
+### Baseline (Uncompressed)
+
+```bash
+python test_baseline.py --cf tasks/configs/wikitext_ppl/llama/share2/share_llama2_7b_20.yaml
+```
+
+### Compressed Model
 
 ```bash
 python test.py --cf tasks/configs/wikitext_ppl/llama/share2/share_llama2_7b_20.yaml
@@ -169,7 +175,9 @@ basis_sharing/
 ├── calib.py              # Calibration utilities
 ├── group.py              # Grouping and SVD utilities
 ├── utils.py              # General utilities
-├── test.py               # Perplexity evaluation
+├── prepare_data.py       # Dataset loading
+├── test_baseline.py      # Baseline (uncompressed) evaluation
+├── test.py               # Compressed model evaluation
 ├── train.py              # Fine-tuning script
 ├── lora.py               # LoRA fine-tuning
 ├── test_adapter.py       # lm_eval benchmarks
