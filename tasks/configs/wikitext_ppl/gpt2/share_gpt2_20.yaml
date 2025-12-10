@@ -22,7 +22,7 @@ calibration_args:
   calib_path: "./calib/gpt2/wikitext"
   dataset_cache_dir: null
   calibration_size: 256
-  calib_batch_size: 64
+  calib_batch_size: 1
 
 model_saving:
   save_untrained_model: true

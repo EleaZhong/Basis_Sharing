@@ -28,7 +28,7 @@ calibration_args:
   calib_path: "./calib/llama-7b/wikitext/"
   dataset_cache_dir: null
   calibration_size: 256
-  calib_batch_size: 16
+  calib_batch_size: 1
 
 after_calibration_update_args:
   update_calib_path: "./calib/llama-7b/wikitext/4update/share_llama-7b_20"

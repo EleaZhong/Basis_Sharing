@@ -17,12 +17,20 @@ class Hook:
 
     def hook_fn(self, module, input, output):
         with torch.no_grad():
-            inp = input[0].detach().float()
+            inp = input[0].detach()
+            # Keep computation in model's dtype to avoid conversion overhead
             inp = inp.flatten(start_dim=0, end_dim=-2)
+            result = inp.T @ inp
             if self.calib is None:
-                self.calib = (inp.T @ inp).cpu()
+                # Keep on GPU to avoid sync, convert to float for accumulation precision
+                self.calib = result.float()
             else:
-                self.calib += (inp.T @ inp).cpu()
+                self.calib += result.float()
+
+    def to_cpu(self):
+        """Move calibration data to CPU (call after all batches processed)."""
+        if self.calib is not None:
+            self.calib = self.calib.cpu()
 
     def close(self):
         self.hook.remove()
@@ -105,8 +113,15 @@ class Calib:
         model.eval()
         for i, batch in tqdm(enumerate(dataloader)):
             with torch.no_grad():
-                batch = {k: v.to(model.device) for k, v in batch.items()}
+                # Remove labels to avoid computing logits/loss - saves ~4GB VRAM
+                # Calibration only needs hook outputs, not model predictions
+                batch = {k: v.to(model.device) for k, v in batch.items() if k != "labels"}
                 out = model(**batch)
+
+        # Move all calibration data to CPU in one go (avoids repeated GPU syncs)
+        for name in names:
+            for hook in hooks[name]:
+                hook.to_cpu()
 
         assert save_path is not None
         for name in names:
@@ -114,7 +129,7 @@ class Calib:
             if not os.path.exists(tmp_save_path):
                 os.makedirs(tmp_save_path)
             for i, hook in enumerate(hooks[name]):
-                data = hook.calib.cpu()
+                data = hook.calib
                 tmp_name = str(i) + ".pkl"
                 Calib.save(os.path.join(tmp_save_path, tmp_name), data)
                 hook.close()
@@ -145,8 +160,15 @@ class Calib:
         model.eval()
         for i, batch in tqdm(enumerate(dataloader)):
             with torch.no_grad():
-                batch = {k: v.to(model.device) for k, v in batch.items()}
+                # Remove labels to avoid computing logits/loss - saves ~4GB VRAM
+                # Calibration only needs hook outputs, not model predictions
+                batch = {k: v.to(model.device) for k, v in batch.items() if k != "labels"}
                 out = model(**batch)
+
+        # Move all calibration data to CPU in one go (avoids repeated GPU syncs)
+        for name in names:
+            for hook in hooks[name]:
+                hook.to_cpu()
 
         assert save_path is not None
         for name in names:
@@ -154,7 +176,7 @@ class Calib:
             if not os.path.exists(tmp_save_path):
                 os.makedirs(tmp_save_path)
             for i, hook in enumerate(hooks[name]):
-                data = hook.calib.cpu()
+                data = hook.calib
                 tmp_name = str(i) + ".pkl"
                 Calib.save(os.path.join(tmp_save_path, tmp_name), data)
                 hook.close()

@@ -28,7 +28,7 @@ calibration_args:
   calib_path: "./calib/llama2-7b/wikitext/"
   dataset_cache_dir: "~/.cache/huggingface/datasets/c4"
   calibration_size: 512
-  calib_batch_size: 16
+  calib_batch_size: 1
 
 after_calibration_update_args:
   update_calib_path: "./calib/llama-7b/wikitext/4update/share_llama2-7b_20"
