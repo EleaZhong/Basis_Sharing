@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch
 from typing import List, Optional, Tuple, Union
-from transformers.models.llama.modeling_llama import (LlamaSdpaAttention, LlamaDecoderLayer,
+from transformers.models.llama.modeling_llama import (LlamaAttention, LlamaDecoderLayer,
                                                       LlamaModel, repeat_kv, apply_rotary_pos_emb, LlamaMLP,
                                                       LlamaForCausalLM)
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
@@ -12,7 +12,7 @@ from models.model_utils import build_basis_collection, Coefficient
 logger = logging.get_logger(__name__)
 
 
-class ShareLlamaSdpaAttention(LlamaSdpaAttention):
+class ShareLlamaAttention(LlamaAttention):
     def __init__(self, config, layer_idx, k_basis, q_basis, v_basis, o_basis):
         super().__init__(config, layer_idx)
         self.q_basis = q_basis
@@ -126,7 +126,7 @@ class ShareLlamaDecoderLayer(LlamaDecoderLayer):
     def __init__(self, config, layer_idx, k_basis, q_basis, v_basis, o_basis, up_basis, gate_basis, down_basis):
         super().__init__(config, layer_idx)
 
-        self.self_attn = ShareLlamaSdpaAttention(config, layer_idx,
+        self.self_attn = ShareLlamaAttention(config, layer_idx,
                                                  k_basis[str(layer_idx)],
                                                  q_basis[str(layer_idx)],
                                                  v_basis[str(layer_idx)],

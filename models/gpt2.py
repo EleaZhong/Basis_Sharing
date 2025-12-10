@@ -3,14 +3,14 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for
     _prepare_4d_causal_attention_mask_for_sdpa
 import torch
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
-from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel, GPT2SdpaAttention, GPT2MLP, GPT2Block, GPT2Model
+from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel, GPT2Attention, GPT2MLP, GPT2Block, GPT2Model
 from transformers.utils import logging
-from model_utils import build_basis_collection, Basis, Coefficient
+from .model_utils import build_basis_collection, Basis, Coefficient
 
 logger = logging.get_logger(__name__)
 
 
-class ShareGPT2SdpaAttention(GPT2SdpaAttention):
+class ShareGPT2Attention(GPT2Attention):
     def __init__(self, config, share_attn, share_o, is_cross_attention=False, layer_idx=None):
         super().__init__(config, is_cross_attention, layer_idx)
         self.share_attn = share_attn
@@ -35,7 +35,7 @@ class ShareGPT2SdpaAttention(GPT2SdpaAttention):
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]], ...]:
         if output_attentions or head_mask is not None:
             logger.warning_once(
-                "`GPT2SdpaAttention` is used but `torch.nn.functional.scaled_dot_product_attention` does not support "
+                "`GPT2Attention` is used but `torch.nn.functional.scaled_dot_product_attention` does not support "
                 "`output_attentions=True` or `head_mask`. Falling back to the manual attention implementation, but "
                 "specifying the manual implementation will be required from Transformers version v5.0.0 onwards. "
                 'This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
@@ -59,7 +59,7 @@ class ShareGPT2SdpaAttention(GPT2SdpaAttention):
             if not hasattr(self, "q_attn"):
                 raise ValueError(
                     "If class is used as cross attention, the weights `q_attn` have to be defined. "
-                    "Please make sure to instantiate class with `GPT2SdpaAttention(..., is_cross_attention=True)`."
+                    "Please make sure to instantiate class with `GPT2Attention(..., is_cross_attention=True)`."
                 )
 
             query = self.q_attn(hidden_states)
@@ -149,7 +149,7 @@ class ShareGPT2Block(GPT2Block):
         share_o = self._in_group(config.o_groups, layer_idx)
         share_up = self._in_group(config.up_groups, layer_idx)
         share_down = self._in_group(config.down_groups, layer_idx)
-        self.attn = ShareGPT2SdpaAttention(config, share_attn, share_o, layer_idx=layer_idx)
+        self.attn = ShareGPT2Attention(config, share_attn, share_o, layer_idx=layer_idx)
         self.mlp = ShareGPT2MLP(inner_dim, config, share_up, share_down, layer_idx)
 
     @staticmethod

@@ -1,9 +1,9 @@
 import torch
-from transformers.models.mistral.modeling_mistral import MistralMLP, MistralSdpaAttention, MistralDecoderLayer, \
+from transformers.models.mistral.modeling_mistral import MistralMLP, MistralAttention, MistralDecoderLayer, \
     MistralModel, MistralForCausalLM, apply_rotary_pos_emb, repeat_kv
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.modeling_outputs import BaseModelOutputWithPast
-from model_utils import build_basis_collection, Coefficient
+from .model_utils import build_basis_collection, Coefficient
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
@@ -42,7 +42,7 @@ class ShareMistralMLP(MistralMLP):
         return down
 
 
-class ShareMistralSdpaAttention(MistralSdpaAttention):
+class ShareMistralAttention(MistralAttention):
     def __init__(self, config, layer_idx, share_k, share_q, share_v, share_o):
         super().__init__(config, layer_idx)
         self.share_k = share_k
@@ -151,7 +151,7 @@ class ShareMistralDecoderLayer(MistralDecoderLayer):
         share_up = self._in_group(config.up_groups, layer_idx)
         share_down = self._in_group(config.down_groups, layer_idx)
         share_gate = self._in_group(config.gate_groups, layer_idx)
-        self.self_attn = ShareMistralSdpaAttention(config, layer_idx, share_k, share_q, share_v, share_o)
+        self.self_attn = ShareMistralAttention(config, layer_idx, share_k, share_q, share_v, share_o)
         self.mlp = ShareMistralMLP(config, share_gate, share_up, share_down, layer_idx)
 
     @staticmethod
