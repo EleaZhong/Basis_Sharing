@@ -1,0 +1,17 @@
+weight_types:
+    attn_c_attn:
+        pattern: '.*\.attn\.c_attn$'
+        split: qkv  # qkv, heads
+        qkv_order: qkv  # string
+        n_head: 12
+    attn_c_proj: 
+        pattern: '.*\.attn\.c_proj$'
+    mlp_c_fc: 
+        pattern: '.*\.mlp\.c_fc$'
+    mlp_c_proj: 
+        pattern: '.*\.mlp\.c_proj$'
+
+layer_pattern: 'h\.(\d+)'
+
+group_size: 2
+compression_rate: 0.9

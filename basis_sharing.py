@@ -1,56 +1,26 @@
-"""
-Model-agnostic Basis Sharing Compression for Transformer Models.
-
-This module provides a wrapper-based approach to compress any transformer model
-by sharing basis matrices across grouped layers and using per-layer coefficients.
-
-Key components:
-- BasisSharingConfig: Configuration for compression parameters
-- ShareLinear: Drop-in replacement for nn.Linear with basis sharing support
-- BasisSharingWrapper: Wraps any model and manages the compression pipeline
-
-Usage:
-    model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
-    config = BasisSharingConfig(
-        target_modules=["self_attn.*_proj", "mlp.*_proj"],
-        group_size=2,
-        compression_ratio=0.2,
-    )
-    wrapper = BasisSharingWrapper(model, config)
-    wrapper.calibrate(dataloader)
-    wrapper.compress()
-"""
-
-from __future__ import annotations
-
 import gc
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+nn.Linear
 import torch.nn.functional as F
 from tqdm import tqdm
 
-# Import Conv1D for GPT-2 support
-try:
-    from transformers.pytorch_utils import Conv1D
-except ImportError:
-    Conv1D = None  # Will be unavailable if transformers not installed
+from transformers.pytorch_utils import Conv1D as TransformersConv1D
 
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-    from torch.utils.data import DataLoader
+from collections.abc import Iterator
+from torch.utils.data import DataLoader
 
 
 class ShareLinearState(Enum):
     """State machine for ShareLinear lifecycle."""
 
-    ORIGINAL = auto()  # Forward uses original weights
-    CALIBRATING = auto()  # Forward uses original weights + tracks inputs
-    COMPRESSED = auto()  # Forward uses basis @ coefficient
+    ORIGINAL = "original"  # Forward uses original weights
+    CALIBRATING = "calibrating"  # Forward uses original weights + tracks inputs
+    COMPRESSED = "compressed"  # Forward uses basis @ coefficient
 
 
 @dataclass
