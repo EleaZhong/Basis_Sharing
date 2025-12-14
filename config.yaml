@@ -14,4 +14,4 @@ weight_types:
 layer_pattern: 'h\.(\d+)'
 
 group_size: 2
-compression_rate: 0.9
+compression_rate: 1.0
